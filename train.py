@@ -1,4 +1,6 @@
 import torch
+from torch import nn
+from torch.nn import functional as F
 import os
 import json
 import copy
@@ -10,6 +12,8 @@ from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, weighted_l2_loss_v2, quat_mult, \
     o3d_knn, params2rendervar, params2cpu, save_params
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
+
+import copy
 
 
 def get_dataset(t, md, seq):
@@ -183,6 +187,28 @@ def report_progress(params, data, i, progress_bar, every_i=100):
         progress_bar.set_postfix({"train img 0 PSNR": f"{psnr:.{7}f}"})
         progress_bar.update(every_i)
 
+class MLP(nn.Module):
+    def __init__(self, in_dim, out_dim) -> None:
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(in_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, out_dim)
+
+        # self.fc1.weight.data.copy_(torch.zeros_like(self.fc1.weight.data))
+        # self.fc1.bias.data.copy_(torch.zeros_like(self.fc1.bias.data))
+
+        # self.fc2.weight.data.copy_(torch.zeros_like(self.fc2.weight.data))
+        # self.fc2.bias.data.copy_(torch.zeros_like(self.fc2.bias.data))
+
+        # self.fc3.weight.data.copy_(torch.zeros_like(self.fc3.weight.data))
+        # self.fc3.bias.data.copy_(torch.zeros_like(self.fc3.bias.data))
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+
+        return x
 
 def train(seq, exp):
     if os.path.exists(f"./output/{exp}/{seq}"):
@@ -191,19 +217,52 @@ def train(seq, exp):
     md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))  # metadata
     num_timesteps = len(md['fn'])
     params, variables = initialize_params(seq, md)
-    optimizer = initialize_optimizer(params, variables)
+
+    gaussian_optimizer = initialize_optimizer(params, variables)
+
     output_params = []
-    for t in range(num_timesteps):
+
+    model = MLP(7, 7).cuda()
+    mlp_optimizer = torch.optim.Adam(params=model.parameters(), lr=1e-4)
+
+    optimizer = gaussian_optimizer
+
+    for t in range(0, num_timesteps, 10):
         dataset = get_dataset(t, md, seq)
         todo_dataset = []
+
         is_initial_timestep = (t == 0)
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
+            
+            # TODO: switch between optimizing Gaussians and optimizing Model
+            optimizer = mlp_optimizer
+
         num_iter_per_timestep = 10000 if is_initial_timestep else 2000
         progress_bar = tqdm(range(num_iter_per_timestep), desc=f"timestep {t}")
+
+
         for i in range(num_iter_per_timestep):
             curr_data = get_batch(todo_dataset, dataset)
-            loss, variables = get_loss(params, curr_data, variables, is_initial_timestep)
+
+            # TODO: switch between computing loss of delta and gaussian loss
+            if not is_initial_timestep:
+                delta = model(torch.cat((params['means3D'], params['unnorm_rotations']), dim=1)) * 0.0001
+                delta_means = delta[:,:3]
+                delta_rotations = delta[:,3:]
+
+                updated_params = copy.deepcopy(params)
+                updated_params['means3D'] = updated_params['means3D'].detach()
+                updated_params['means3D'] += delta_means.detach()
+                updated_params['unnorm_rotations'] = updated_params['unnorm_rotations'].detach()
+                updated_params['unnorm_rotations'] += delta_rotations
+
+                loss, variables = get_loss(updated_params, curr_data, variables, is_initial_timestep)
+            else:
+                loss, variables = get_loss(params, curr_data, variables, is_initial_timestep)
+            
+            print(loss.item())
+
             loss.backward()
             with torch.no_grad():
                 report_progress(params, dataset[0], i, progress_bar)
