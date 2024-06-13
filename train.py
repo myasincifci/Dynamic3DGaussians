@@ -14,7 +14,7 @@ from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, w
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
 
 import copy
-
+import wandb
 
 def get_dataset(t, md, seq):
     dataset = []
@@ -190,9 +190,12 @@ def report_progress(params, data, i, progress_bar, every_i=100):
 class MLP(nn.Module):
     def __init__(self, in_dim, out_dim) -> None:
         super(MLP, self).__init__()
-        self.fc1 = nn.Linear(in_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, out_dim)
+        self.fc1 = nn.Linear(in_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, 64)
+        self.fc4 = nn.Linear(64, 128)
+        self.fc5 = nn.Linear(128, 256)
+        self.fc6 = nn.Linear(256, out_dim)
 
         # self.fc1.weight.data.copy_(torch.zeros_like(self.fc1.weight.data))
         # self.fc1.bias.data.copy_(torch.zeros_like(self.fc1.bias.data))
@@ -204,11 +207,16 @@ class MLP(nn.Module):
         # self.fc3.bias.data.copy_(torch.zeros_like(self.fc3.bias.data))
 
     def forward(self, x):
+        x_ = x
+
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = self.fc3(x)
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        x = F.relu(self.fc5(x))
+        x = self.fc6(x)
 
-        return x
+        return x_ + x
 
 def train(seq, exp):
     if os.path.exists(f"./output/{exp}/{seq}"):
@@ -227,7 +235,7 @@ def train(seq, exp):
 
     optimizer = gaussian_optimizer
 
-    for t in range(0, num_timesteps, 10):
+    for t in range(0, num_timesteps, 1):
         dataset = get_dataset(t, md, seq)
         todo_dataset = []
 
@@ -235,7 +243,7 @@ def train(seq, exp):
         if not is_initial_timestep:
             params, variables = initialize_per_timestep(params, variables, optimizer)
             
-            # TODO: switch between optimizing Gaussians and optimizing Model
+            # switch between optimizing Gaussians and optimizing Model
             optimizer = mlp_optimizer
 
         num_iter_per_timestep = 10000 if is_initial_timestep else 2000
@@ -247,13 +255,13 @@ def train(seq, exp):
 
             # TODO: switch between computing loss of delta and gaussian loss
             if not is_initial_timestep:
-                delta = model(torch.cat((params['means3D'], params['unnorm_rotations']), dim=1)) * 0.0001
-                delta_means = delta[:,:3]
-                delta_rotations = delta[:,3:]
+                delta = 0 # model(torch.cat((params['means3D'], params['unnorm_rotations']), dim=1))
+                delta_means = 0 # delta[:,:3]
+                delta_rotations = 0 # delta[:,3:]
 
                 updated_params = copy.deepcopy(params)
                 updated_params['means3D'] = updated_params['means3D'].detach()
-                updated_params['means3D'] += delta_means.detach()
+                updated_params['means3D'] += delta_means
                 updated_params['unnorm_rotations'] = updated_params['unnorm_rotations'].detach()
                 updated_params['unnorm_rotations'] += delta_rotations
 
@@ -261,7 +269,7 @@ def train(seq, exp):
             else:
                 loss, variables = get_loss(params, curr_data, variables, is_initial_timestep)
             
-            print(loss.item())
+            wandb.log({f"loss-{t}": loss})
 
             loss.backward()
             with torch.no_grad():
@@ -278,6 +286,8 @@ def train(seq, exp):
 
 
 if __name__ == "__main__":
+    wandb.init(project="dynamic-gaussians")
+
     exp_name = "exp1"
     for sequence in ["basketball", "boxes", "football", "juggle", "softball", "tennis"]:
         train(sequence, exp_name)
