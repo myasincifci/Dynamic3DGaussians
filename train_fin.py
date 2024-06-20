@@ -12,7 +12,7 @@ import wandb
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 from helpers import o3d_knn, setup_camera
 
-from torch.optim.lr_scheduler import LinearLR
+from torch.optim.lr_scheduler import LambdaLR
 
 def get_dataset(t, md, seq):
     dataset = []
@@ -66,16 +66,16 @@ def load_params(path: str):
 class MLP(nn.Module):
     def __init__(self, in_dim, seq_len) -> None:
         super(MLP, self).__init__()
-        self.fc1 = nn.Linear(in_dim + 3, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, 128)
-        self.fc5 = nn.Linear(128, 256)
-        self.fc6 = nn.Linear(256, in_dim)
+        self.fc1 = nn.Linear(in_dim + 2, 64)
+        self.fc2 = nn.Linear(64, 128)
+        self.fc3 = nn.Linear(128, 256)
+        self.fc4 = nn.Linear(256, 128)
+        self.fc5 = nn.Linear(128, 64)
+        self.fc6 = nn.Linear(64, in_dim)
 
         self.relu = nn.ReLU()
 
-        self.emb = nn.Embedding(seq_len, in_dim)
+        self.emb = nn.Embedding(seq_len, 2)
 
     def dec2bin(self, x, bits):
         # mask = 2 ** torch.arange(bits).to(x.device, x.dtype)
@@ -87,8 +87,8 @@ class MLP(nn.Module):
 
         x_ = x
 
-        # e = self.emb(t).repeat(B, 1)
-        e = self.dec2bin(t, 3).repeat(B, 1)
+        e = self.emb(t).repeat(B, 1)
+        # e = self.dec2bin(t, 3).repeat(B, 1)
 
         x = torch.cat((x, e), dim=1)
 
@@ -104,13 +104,15 @@ class MLP(nn.Module):
 
 def train(seq: str):
     md = json.load(open(f"./data/{seq}/train_meta.json", 'r'))
-    seq_len = len(md['fn'])
+    seq_len = 20 # len(md['fn'])
     params = load_params('params.pth')
     
     mlp = MLP(7, seq_len).cuda()
     mlp_optimizer = torch.optim.Adam(params=mlp.parameters(), lr=1e-3)
 
-    for t in range(1, seq_len, 1):
+    ## Initial Training
+
+    for t in range(0, seq_len , 1):
         dataset = get_dataset(t, md, seq)
         dataset_queue = []
 
@@ -150,6 +152,48 @@ def train(seq: str):
 
         wandb.log({
             f'mean-losses': sum(losses) / len(losses)
+        })
+
+    ## Random Training
+    dataset = []
+    for t in range(20):
+        dataset += [get_dataset(t, md, seq)]
+    for i in tqdm(range(10_000)):
+        di = torch.randint(0, len(dataset), (1,))
+        si = torch.randint(0, len(dataset[0]), (1,))
+        X = dataset[di][si]
+
+        delta = mlp(torch.cat((params['means'], params['rotations']), dim=1), torch.tensor(t).cuda())
+        delta_means = delta[:,:3]
+        delta_rotations = delta[:,3:]
+
+        l = 0.01
+        updated_params = copy.deepcopy(params)
+        updated_params['means'] = updated_params['means'].detach()
+        updated_params['means'] += delta_means * l
+        updated_params['rotations'] = updated_params['rotations'].detach()
+        updated_params['rotations'] += delta_rotations * l
+
+        loss = get_loss(updated_params, X)
+
+        wandb.log({
+            f'loss-new': loss.item(),
+        })
+
+        loss.backward()
+
+        mlp_optimizer.step()
+        mlp_optimizer.zero_grad()
+
+    for d in dataset:
+        losses = []
+        with torch.no_grad():
+            for X in d:
+                loss = get_loss(updated_params, X)
+                losses.append(loss.item())
+
+        wandb.log({
+            f'mean-losses-new': sum(losses) / len(losses)
         })
 
 def main():
